@@ -15,12 +15,21 @@ webcamId = 3
 camWidth, camHeight = 640, 480
 camFPS = 60
 confidence = 0.70  # confidence to detect the object
-yoloModelPath = "ball.pt"
+yoloModelPath = "tool/ball.pt"
 classNames = ['ball']
-calibrationFilePath = 'calibration.p'
+calibrationFilePath = 'tool/calibration.p'
 ballArea = {"min": 1300, "max": 2500}
 scale = 3  # ratio of input vs output image, e.g., 1920/640 = 3
 
+#* Add these global variables to improve the detection accuracy
+kalman = None  # Kalman filter object
+trackerInitialized = False
+consecutiveDetections = 0
+missCounter = 0
+predictedPos = None
+DISTANCE_THRESHOLD = 50  # Pixels
+CONSECUTIVE_THRESHOLD = 3  # Frames for hit confirmation
+MISS_THRESHOLD = 10  # Frames before resetting tracker
 
 
 showHitImage = False
@@ -151,33 +160,78 @@ def drawHit(imgDraw, obj, type="circle", imgToOverlay=[], showHitImage=False):
     return imgDraw
 
 
+#* Add a function to set up the Kalman filter
+def initKalmanFilter(cx, cy):
+    global kalman, trackerInitialized, predictedPos
+    kalman = cv2.KalmanFilter(4, 2)  # 4 state variables (x, y, vx, vy), 2 measurements (x, y)
+    kalman.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
+    kalman.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
+    kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
+    kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 10
+    kalman.statePre = np.array([[cx], [cy], [0], [0]], np.float32)
+    predictedPos = (cx, cy)
+    trackerInitialized = True
 
+#* Modify Main Loop
 # Main loop for processing frames from the webcam and performing hit detection
 while True:
     success, img = cap.read()
     imgProjector = warpImage(img, points, 640, 360)
     imgWithObjects, objects = detectObject(imgProjector)
 
-    # Perform hit detection and draw hit if found
-    hitPoint = detectHit(objects)
+    # Tracking logic
+    if trackerInitialized:
+        # Predict next position
+        prediction = kalman.predict()
+        predictedPos = (int(prediction[0]), int(prediction[1]))
 
-    if hitPoint and hitCount == 0:
+        # Find closest detection
+        closestObj = None
+        minDist = float('inf')
+        for obj in objects:
+            cx, cy = obj[5]  # Center of detected object
+            dist = math.sqrt((cx - predictedPos[0])**2 + (cy - predictedPos[1])**2)
+            if dist < minDist:
+                minDist = dist
+                closestObj = obj
+
+        # Update tracker or handle miss
+        if closestObj and minDist < DISTANCE_THRESHOLD and ballArea["min"] < closestObj[4] < ballArea["max"]:
+            cx, cy = closestObj[5]
+            kalman.correct(np.array([[np.float32(cx)], [np.float32(cy)]]))
+            consecutiveDetections += 1
+            missCounter = 0
+        else:
+            consecutiveDetections = 0
+            missCounter += 1
+            if missCounter >= MISS_THRESHOLD:
+                trackerInitialized = False
+                missCounter = 0
+
+    else:
+        # Initialize tracker with first valid detection
+        hitPoint = detectHit(objects)
+        if hitPoint:
+            cx, cy = hitPoint[5]
+            initKalmanFilter(cx, cy)
+            consecutiveDetections = 1
+
+    # Hit confirmation
+    if consecutiveDetections >= CONSECUTIVE_THRESHOLD and hitCount == 0:
+        hitPoint = closestObj if closestObj else [0, 0, 0, 0, 0, predictedPos, imgProjector]
         imgOutput = drawHit(imgOutput, hitPoint, type=mode, showHitImage=showHitImage)
-
-        hitPoint = []
         hitCount = 1
+        trackerInitialized = False  # Reset tracker after hit
+        consecutiveDetections = 0
 
     if hitCount != 0:
         hitCount += 1
-        if hitCount >= 10:
+        if hitCount >= delayFrames:
             hitCount = 0
 
-    # Update FPS and display images
+    # Update FPS and display
     fps, img = fpsReader.update(imgWithObjects)
-
-    # Display
     cv2.imshow("Image", img)
-    #cv2.imshow("Image Projector", imgWithObjects)
     if mode != "mouse":
         if fullScreen:
             cv2.setWindowProperty("Image Out", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
@@ -185,8 +239,8 @@ while True:
         cv2.imshow("Image Out", imgOutput)
 
     key = cv2.waitKey(1)
-    if key == ord('r'):  # press r to reset the image
+    if key == ord('r'):
         imgOutput = np.zeros((1080, 1920, 3), np.uint8)
         imgOutput[:] = 0, 0, 0
-    if key == ord('q'):  # press q to quit
+    if key == ord('q'):
         break
